@@ -1,100 +1,14 @@
-# 1.2 — Bookshelf REST API (in-memory)
+# Bookshelf REST API (in-memory)
 
-A small JSON REST API for managing a collection of books. Full CRUD on `/books` (well, `/`) with everything held in a single in-memory `map[int]Book` behind a `sync.RWMutex`. No database, no router library — just `net/http` and Go 1.22+ pattern matching.
+A JSON REST API for managing a collection of books. Full CRUD on `/` with state held in a single in-memory `map[int]Book` behind a `sync.RWMutex`. No database, no router library — just `net/http` and Go 1.22+ pattern matching.
 
-This is project **1.2** of my Go learning track — the first time the program is a *server* instead of a CLI, and the first time concurrency really matters (every HTTP request runs in its own goroutine).
-
-## How it works
-
-The whole API is one file. State is a package-level map keyed by integer ID; reads grab `mu.RLock()`, writes grab `mu.Lock()`. Routes are registered against the default `ServeMux` using Go 1.22+ method-prefixed patterns, so the mux itself handles `GET` vs `POST` vs `PUT` vs `DELETE` dispatching — no manual `switch req.Method` in each handler.
-
-```go
-http.HandleFunc("GET /",        getAllBooks)
-http.HandleFunc("GET /{id}",    getSpecificBook)
-http.HandleFunc("POST /",       makeNewBook)
-http.HandleFunc("PUT /{id}",    updateSpecificBook)
-http.HandleFunc("DELETE /{id}", deleteSpecificBook)
-```
-
-### Path values via `req.PathValue`
-
-Go 1.22's pattern matcher lets you declare `{id}` in the route and pull it out with `req.PathValue("id")`. It comes out as a string, so the handler runs it through `strconv.Atoi` and 400s on a non-numeric input before touching the map.
-
-```go
-idToGet, err := strconv.Atoi(req.PathValue("id"))
-if err != nil {
-    http.Error(w, "Bad request", http.StatusBadRequest)
-    return
-}
-```
-
-### `RWMutex` because reads dominate
-
-Listing books and fetching one book are read-only; create/update/delete mutate the map. `sync.RWMutex` lets any number of `RLock` callers hold the lock simultaneously, but a `Lock` caller waits for all readers and then has exclusive access. Reads scale; writes serialize. For a read-heavy workload (most APIs), it's the right primitive.
-
-Every handler `defer`s the unlock right after locking, so an early `return` from an error branch can't leak the lock.
-
-### Max-scan ID generation, not `len(books) + 1`
-
-A natural first instinct for "next ID" is `len(books) + 1`. That breaks the moment anything gets deleted: if you have IDs `[1, 2, 3]` and delete `2`, `len(books) + 1 == 3` — which collides with the existing `3`. Fix: scan the map for the current maximum and add one.
-
-```go
-maxId := -1
-for id := range books {
-    if id > maxId {
-        maxId = id
-    }
-}
-book.Id = maxId + 1
-```
-
-`maxId` starts at `-1` so the first inserted book gets `id = 0` (or `id = 1`, depending on taste — the constant is the only knob). O(n) per insert is fine for an in-memory toy; a real system would store the next-ID separately or use UUIDs.
-
-### Existence checks use the comma-ok idiom
-
-`books[id]` on a missing key returns the zero value of `Book` — *not* an error. To distinguish "this key exists and the book happens to be all-zeros" from "this key doesn't exist," the two-value form is the right tool:
-
-```go
-_, ok := books[idToGet]
-if !ok {
-    http.Error(w, "Book not found", http.StatusNotFound)
-    return
-}
-```
-
-Comparing against `Book{}` looks tempting but is wrong on principle (a real book with empty fields would be treated as missing) and tied to the struct definition (add a field and the comparison silently changes meaning).
-
-### PUT lets the URL win
-
-When a `PUT /5` request arrives with a body that says `{"id": 99, "title": "..."}`, two IDs are in play. The URL says "update record 5"; the body says "the new record has id 99." Honoring the body would let clients teleport records to new IDs — bad. So the handler overwrites whatever the client sent with the URL's id before storing:
-
-```go
-book.Id = idToUpdate
-books[idToUpdate] = book
-```
-
-The URL is canonical; the body's `id` field is ignored.
-
-### Status codes match HTTP semantics
-
-- `GET` → `200 OK` with the JSON body
-- `POST` → `201 Created` with the JSON of the new record (so the client learns the assigned ID)
-- `PUT` → `200 OK`
-- `DELETE` → `200 OK`
-- Missing record → `404 Not Found`
-- Malformed JSON or non-numeric `{id}` → `400 Bad Request`
-
-`http.Error` writes the status code, a `Content-Type: text/plain` header, and the message in one call — but only when used instead of, not after, your own `WriteHeader`.
-
-## How to run it
+## How to use
 
 ```sh
 go run .
 ```
 
 Server listens on `127.0.0.1:8080`.
-
-### Endpoints
 
 | Method   | Path     | What it does                                  |
 | -------- | -------- | --------------------------------------------- |
@@ -104,35 +18,25 @@ Server listens on `127.0.0.1:8080`.
 | `PUT`    | `/{id}`  | Replace the book at that id                   |
 | `DELETE` | `/{id}`  | Remove the book at that id                    |
 
-### Example session
-
 ```sh
 $ curl -X POST http://localhost:8080/ \
     -H 'Content-Type: application/json' \
     -d '{"title":"The Pragmatic Programmer","author":"Hunt & Thomas","release_date":"1999-10-20T00:00:00Z"}'
-{"id":0,"title":"The Pragmatic Programmer","author":"Hunt & Thomas","release_date":"1999-10-20T00:00:00Z"}
 
 $ curl http://localhost:8080/0
-{"id":0,"title":"The Pragmatic Programmer","author":"Hunt & Thomas","release_date":"1999-10-20T00:00:00Z"}
-
-$ curl -X PUT http://localhost:8080/0 \
-    -H 'Content-Type: application/json' \
-    -d '{"title":"The Pragmatic Programmer (2nd ed)","author":"Hunt & Thomas","release_date":"2019-09-13T00:00:00Z"}'
-Book updated successfully
 
 $ curl -X DELETE http://localhost:8080/0
-Book deleted successfully
 ```
 
 ## What I learned
 
-- **An HTTP server is concurrent by default.** `net/http` spawns a goroutine per request without asking. The moment two requests touch the same `map`, you have a data race — which Go's runtime actively detects and turns into a panic. The mutex isn't optional; it's the price of having shared state in a stdlib HTTP server.
-- **`RWMutex` only helps when reads dominate.** It lets multiple readers proceed concurrently but serializes writes. For a CRUD API where listing is hit far more than creating, that's the right shape. For a write-heavy workload, plain `sync.Mutex` is simpler and no slower in practice.
-- **JSON struct tags are picky about whitespace.** `` `json:"id"` `` works; `` `json: "id"` `` (with a space after the colon) silently fails to apply the tag, and the field gets serialized under its Go name (`Id`). Tags are parsed by `reflect.StructTag` at runtime, not validated by the compiler — so the mistake compiles fine and shows up only when the wire format is wrong.
-- **`len(map) + 1` is not an ID generator.** It works exactly until the first delete, then collides. Either scan for the max and add one, or store the next-id separately. The bug was in my first pass and was instantly visible the moment I tried deleting and re-adding.
-- **The comma-ok map idiom is the only correct existence check.** `books[id] == Book{}` couples the existence check to the struct shape and treats a genuinely empty record as missing. `_, ok := books[id]` is the idiom for a reason.
-- **PUT requires the URL to win over the body.** Otherwise a client can repoint records by sending a different `id` in the JSON. The handler overwrites `book.Id = idToUpdate` before storing — the URL is canonical, the body's id field is data the client doesn't get to control.
-- **Set status *before* writing the body.** `w.Write([]byte(...))` implicitly calls `WriteHeader(200)` if you haven't already. Once headers are flushed, you can't change them — so a later `WriteHeader(404)` is silently ignored and logs a `superfluous response.WriteHeader call`. The discipline is: headers first, status next, body last.
-- **`http.Error` is a one-liner replacement for the three-step error response.** It writes the `Content-Type: text/plain` header, the status code, and the message in one call. Mixing it with manual `w.WriteHeader` and `w.Write` in the same branch is a code smell — pick one and stick with it.
-- **`delete(m, k)` can't fail on a missing key.** It's a no-op, so checking `if !deleted { ... }` after the call is dead code. The existence check has to happen *before* the delete if you want a 404 response for missing IDs.
-- **Coarse-grained locks scale until they don't.** A single mutex over the whole map is the right call here — contention is low, the critical sections are tiny, and the code stays readable. For a real high-traffic system you'd shard the lock, use `sync.Map`, or — much better — push state into a database where MVCC handles the concurrency for you. That's exactly what Phase 2 will look like: this same API, but Postgres-backed and a lot of these concerns just dissolve.
+- **An HTTP server is concurrent by default.** `net/http` spawns a goroutine per request. Two requests touching the same `map` is a data race; the mutex isn't optional.
+- **`RWMutex` only helps when reads dominate.** Multiple readers can hold `RLock` at once; writers serialize. For a read-heavy CRUD API, that's the right shape.
+- **JSON struct tags are picky about whitespace.** `` `json:"id"` `` works; `` `json: "id"` `` silently fails and serializes under the Go field name. Parsed by reflection at runtime — the compiler doesn't catch it.
+- **`len(map) + 1` is not an ID generator.** Breaks the moment anything is deleted. Either scan for the max and add one, or store the next-id separately.
+- **The comma-ok map idiom is the only correct existence check.** `_, ok := books[id]`. Comparing against `Book{}` couples the check to the struct shape and misclassifies genuinely empty records as missing.
+- **PUT requires the URL to win over the body.** Otherwise a client can repoint records by sending a different `id` in the JSON. Overwrite `book.Id = idToUpdate` before storing.
+- **Set status *before* writing the body.** `w.Write(...)` implicitly calls `WriteHeader(200)`. Once flushed, headers can't be changed and a later `WriteHeader(404)` is silently ignored.
+- **`http.Error` is a one-liner replacement for the three-step error response.** Writes `Content-Type: text/plain`, the status code, and the message in one call.
+- **`delete(m, k)` can't fail on a missing key** — it's a no-op. The existence check has to happen *before* the delete if you want a 404 for missing IDs.
+- **`req.PathValue("id")` returns a string.** Run it through `strconv.Atoi` and 400 on a non-numeric input before touching the map.
